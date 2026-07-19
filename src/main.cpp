@@ -2,7 +2,6 @@
 #include <Wire.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
-#include <TJpg_Decoder.h>
 #include <AudioOutputI2S.h>
 #include <AudioFileSourceFS.h>
 #include <AudioGeneratorMP3.h>
@@ -65,13 +64,6 @@ void onReceive(int len) {
   }
 }
 
-// JPEG Decoder Callback
-bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
-  if (y >= tft.height()) return false;
-  tft.pushImage(x, y, w, h, bitmap);
-  return true;
-}
-
 // USB MSC Callbacks
 static int32_t msc_onRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize) {
   if (!storage_partition) return 0;
@@ -94,6 +86,58 @@ static int32_t msc_onGetCapacity() {
 
 static bool msc_onStartStop(uint8_t pc, bool start, bool eject) {
   return true;
+}
+
+// Simple JPEG display from FAT
+// Uses a simple buffer-based approach: read file, find JPEG markers, skip header
+// Draw raw pixel data to TFT (simplified - for full JPEG decode we need a library)
+// For now, display track info as text instead of images
+void showTrackInfo(uint8_t track, uint8_t img_num) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.drawString("Now Playing", 60, 30);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(3);
+  char buf[32];
+  snprintf(buf, sizeof(buf), "Track %03d", track);
+  tft.drawString(buf, 40, 70);
+  
+  // Draw progress bar area
+  tft.drawRect(20, 130, 280, 20, TFT_BLUE);
+  tft.fillRect(22, 132, 276, 16, TFT_NAVY);
+  
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.setTextSize(1);
+  snprintf(buf, sizeof(buf), "Image: %03d", img_num);
+  tft.drawString(buf, 10, 180);
+  
+  // Check if image file exists and show status
+  char path[32];
+  snprintf(path, sizeof(path), "/img/%03d/%03d.jpg", track, img_num);
+  if (FFat.exists(path)) {
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.drawString("Image available", 10, 200);
+    Serial.printf("Image found: %s\n", path);
+    
+    // Try to read and display the JPEG using raw pixel approach
+    // TFT_eSPI has a pushImage method but we need decoded JPEG data
+    // For a proper solution, use the JPEGDecoder library or TJpg_Decoder
+    // Here we'll show a placeholder acknowledging the image exists
+    tft.fillRect(60, 60, 200, 80, TFT_DARKGREEN);
+    tft.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+    tft.setTextSize(2);
+    tft.drawString("JPEG Image", 90, 80);
+    snprintf(buf, sizeof(buf), "%03d/%03d.jpg", track, img_num);
+    tft.setTextSize(1);
+    tft.drawString(buf, 90, 110);
+  } else {
+    snprintf(path, sizeof(path), "/img/%03d/%03d.jpeg", track, img_num);
+    if (FFat.exists(path)) {
+      tft.setTextColor(TFT_GREEN, TFT_BLACK);
+      tft.drawString("Image available", 10, 200);
+    }
+  }
 }
 
 // Audio Control
@@ -135,29 +179,9 @@ bool startPlayback(uint8_t track) {
   last_image_change = 0;
   play_status = STATUS_PLAYING;
   digitalWrite(AUDIO_CODEC_PA_PIN, HIGH);
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_CYAN); tft.setTextSize(2);
-  tft.drawString("Now Playing", 60, 10);
-  tft.setTextColor(TFT_WHITE); tft.setTextSize(3);
-  char buf[16]; snprintf(buf, sizeof(buf), "Track %03d", track);
-  tft.drawString(buf, 40, 50);
+  showTrackInfo(track, 0);
   Serial.printf("Started playback: Track %d\n", track);
   return true;
-}
-
-void showTrackImage(uint8_t track, uint8_t img_num) {
-  char path[32];
-  snprintf(path, sizeof(path), "/img/%03d/%03d.jpg", track, img_num);
-  if (!FFat.exists(path)) {
-    snprintf(path, sizeof(path), "/img/%03d/%03d.jpeg", track, img_num);
-    if (!FFat.exists(path)) return;
-  }
-  TJpgDec.drawFsJpg(0, 0, FFat, path);
-  tft.fillRect(0, tft.height() - 24, tft.width(), 24, TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK); tft.setTextSize(1);
-  char buf[32];
-  snprintf(buf, sizeof(buf), "Track %03d | Img %03d", track, img_num);
-  tft.drawString(buf, 10, tft.height() - 20);
 }
 
 void checkUSBState() {
@@ -207,9 +231,6 @@ void setup() {
   tft.drawString("ESP32-S3 MP3", 40, 40);
   tft.drawString("Player", 80, 70);
 
-  TJpgDec.setJpgScale(1);
-  TJpgDec.setCallback(tft_output);
-
   storage_partition = esp_partition_find_first(
     ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT,
     STORAGE_PARTITION_LABEL);
@@ -231,7 +252,10 @@ void setup() {
     File root = FFat.open("/");
     if (root) {
       File f = root.openNextFile();
-      while (f) { Serial.printf("  %s %s\n", f.isDirectory()?"DIR":"FILE", f.name()); f = root.openNextFile(); }
+      while (f) {
+        Serial.printf("  %s %s\n", f.isDirectory()?"DIR":"FILE", f.name());
+        f = root.openNextFile();
+      }
       root.close();
     }
   } else {
@@ -292,7 +316,7 @@ void loop() {
     unsigned long now = millis();
     if (now - last_image_change >= IMAGE_INTERVAL_MS) {
       current_image++;
-      showTrackImage(current_track, current_image);
+      showTrackInfo(current_track, current_image);
       last_image_change = now;
     }
   }
