@@ -1,0 +1,62 @@
+name: PlatformIO Build
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install PlatformIO Core
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio
+
+      - name: Build firmware
+        run: |
+          pio run --environment esp32-s3-dev
+
+      - name: List build artifacts
+        run: |
+          ls -la .pio/build/esp32-s3-dev/
+
+      - name: Upload firmware binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32s3-mp3-player-firmware
+          path: |
+            .pio/build/esp32-s3-dev/firmware.bin
+            .pio/build/esp32-s3-dev/partitions.bin
+            .pio/build/esp32-s3-dev/bootloader.bin
+          compression-level: 9
+          retention-days: 7
+
+      - name: Create flash instructions
+        run: |
+          echo "=== ESP32-S3 MP3 Player Firmware ===" > flash_info.txt
+          echo "" >> flash_info.txt
+          echo "Flash command (16MB ESP32-S3):" >> flash_info.txt
+          echo "esptool.py --chip esp32s3 --baud 921600 --before default_reset --after hard_reset write_flash -z --flash_mode qio --flash_freq 80m --flash_size 16MB" >> flash_info.txt
+          echo "  0x0 bootloader.bin" >> flash_info.txt
+          echo "  0x10000 firmware.bin" >> flash_info.txt
+          echo "  0x9000 partitions.bin" >> flash_info.txt
+          echo "" >> flash_info.txt
+          ls -lh .pio/build/esp32-s3-dev/*.bin >> flash_info.txt
+
+      - name: Upload flash info
+        uses: actions/upload-artifact@v4
+        with:
+          name: flash-instructions
+          path: flash_info.txt
+          retention-days: 7

@@ -1,0 +1,8 @@
+.pio
+.pioenvs
+.piolib
+.vscode
+*.o
+*.d
+*.a
+__pycache__
