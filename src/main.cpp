@@ -24,7 +24,6 @@
 static uint8_t current_track = 0;
 static uint8_t target_track = 0;
 static uint8_t play_status = STATUS_STOPPED;
-static bool ffat_mounted = false;
 
 AudioGeneratorMP3 *mp3 = NULL;
 AudioFileSourceFS *audio_file = NULL;
@@ -39,8 +38,6 @@ static const int IMAGE_INTERVAL_MS = 5000;
 USBMSC MSC;
 static const esp_partition_t *storage_partition = NULL;
 #define STORAGE_PARTITION_LABEL "storage"
-static uint32_t msc_block_count = 0;
-static bool usb_started = false;
 
 // I2C Slave Callbacks
 void onRequest() {
@@ -82,7 +79,6 @@ static bool msc_onStartStop(uint8_t pc, bool start, bool eject) {
   return true;
 }
 
-// Display track info
 void showTrackInfo(uint8_t track, uint8_t img_num) {
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
@@ -93,30 +89,14 @@ void showTrackInfo(uint8_t track, uint8_t img_num) {
   char buf[32];
   snprintf(buf, sizeof(buf), "Track %03d", track);
   tft.drawString(buf, 40, 70);
-
   tft.drawRect(20, 130, 280, 20, TFT_BLUE);
   tft.fillRect(22, 132, 276, 16, TFT_NAVY);
-
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
   tft.setTextSize(1);
   snprintf(buf, sizeof(buf), "Image: %03d", img_num);
   tft.drawString(buf, 10, 180);
-
-  char path[32];
-  snprintf(path, sizeof(path), "/img/%03d/%03d.jpg", track, img_num);
-  if (FFat.exists(path)) {
-    tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.drawString("Image available", 10, 200);
-    Serial.printf("Image found: %s\n", path);
-  }
-  snprintf(path, sizeof(path), "/img/%03d/%03d.jpeg", track, img_num);
-  if (FFat.exists(path)) {
-    tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.drawString("Image available", 10, 200);
-  }
 }
 
-// Audio Control
 void stopPlayback() {
   if (mp3 && mp3->isRunning()) mp3->stop();
   delete mp3; mp3 = NULL;
@@ -160,42 +140,6 @@ bool startPlayback(uint8_t track) {
   return true;
 }
 
-void checkUSBState() {
-  if (!usb_started) return;
-  static bool prev_connected = false;
-  bool connected = MSC.isReady();
-
-  if (connected && !prev_connected) {
-    Serial.println("USB connected - unmounting FFat");
-    if (ffat_mounted) {
-      stopPlayback();
-      FFat.end();
-      ffat_mounted = false;
-    }
-    tft.fillScreen(TFT_BLUE);
-    tft.setTextColor(TFT_WHITE); tft.setTextSize(2);
-    tft.drawString("USB Mass Storage", 20, 100);
-    tft.drawString("Connected", 60, 140);
-  }
-  if (!connected && prev_connected) {
-    Serial.println("USB disconnected - remounting FFat");
-    delay(500);
-    if (FFat.begin(false, STORAGE_PARTITION_LABEL, 5)) {
-      ffat_mounted = true;
-      Serial.println("FFat remounted");
-      tft.fillScreen(TFT_BLACK);
-      tft.setTextColor(TFT_GREEN); tft.setTextSize(2);
-      tft.drawString("USB Disconnected", 20, 100);
-      tft.drawString("Ready", 100, 140);
-    } else {
-      Serial.println("FFat remount failed!");
-      tft.fillScreen(TFT_RED);
-      tft.drawString("FS Error", 60, 120);
-    }
-  }
-  prev_connected = connected;
-}
-
 void setup() {
   Serial.begin(115200); delay(1000);
   Serial.println("ESP32-S3 MP3 Player with I2C Slave");
@@ -214,14 +158,12 @@ void setup() {
     Serial.printf("Storage: offset=0x%X, size=%u MB\n",
       storage_partition->address, storage_partition->size / (1024*1024));
     tft.drawString("Partition OK", 60, 120);
-    msc_block_count = storage_partition->size / 512;
   } else {
     tft.setTextColor(TFT_RED);
     tft.drawString("Partition FAIL", 40, 120);
   }
 
   if (FFat.begin(false, STORAGE_PARTITION_LABEL, 5)) {
-    ffat_mounted = true;
     Serial.println("FFat mounted");
     tft.setTextColor(TFT_GREEN);
     tft.drawString("FFat Mounted", 40, 150);
@@ -250,16 +192,16 @@ void setup() {
   digitalWrite(AUDIO_CODEC_PA_PIN, LOW);
 
   // Setup USB MSC
-  MSC.vendorID("ESP32");
-  MSC.productID("S3-MP3-Player");
-  MSC.productRevision("1.0");
-  MSC.onStartStop(msc_onStartStop);
-  MSC.onRead(msc_onRead);
-  MSC.onWrite(msc_onWrite);
-  if (msc_block_count > 0) {
-    MSC.begin(msc_block_count, 512);
+  if (storage_partition) {
+    uint32_t block_count = storage_partition->size / 512;
+    MSC.vendorID("ESP32");
+    MSC.productID("S3-MP3-Player");
+    MSC.productRevision("1.0");
+    MSC.onStartStop(msc_onStartStop);
+    MSC.onRead(msc_onRead);
+    MSC.onWrite(msc_onWrite);
+    MSC.begin(block_count, 512);
     USB.begin();
-    usb_started = true;
     Serial.println("USB MSC started");
   }
 
@@ -271,8 +213,6 @@ void setup() {
 }
 
 void loop() {
-  checkUSBState();
-
   if (target_track >= 1 && target_track <= 255) {
     uint8_t t = target_track;
     target_track = 0;
