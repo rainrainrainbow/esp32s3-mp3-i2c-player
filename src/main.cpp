@@ -7,8 +7,8 @@
 #include <AudioGeneratorMP3.h>
 #include <FFat.h>
 #include <esp_partition.h>
-#include <esp_spiram.h>
-#include <esp_task_wdt.h>
+
+
 #include "USB.h"
 #include "USBMSC.h"
 #include "board_config.h"
@@ -149,21 +149,16 @@ void setup() {
   // Kill all watchdogs immediately
   disableCore0WDT();
   disableCore1WDT();
-  WRITE_PERI_REG(RTC_CNTL_WDTWPROTECT_REG, 0x50D83AA1);
-  WRITE_PERI_REG(RTC_CNTL_WDT_CONFIG_REG, 0);
-  WRITE_PERI_REG(RTC_CNTL_WDTWPROTECT_REG, 0);
 
   Serial.begin(115200);
   delay(500);
   Serial.println("\n=== ESP32-S3 MP3 Player ===");
 
   // Check PSRAM status - don't crash if missing
-  size_t psram_size = 0;
   if (psramFound()) {
-    psram_size = esp_spiram_get_size();
-    Serial.printf("PSRAM found: %u MB\n", psram_size / (1024 * 1024));
+    Serial.printf("PSRAM found: %u MB\n", ESP.getPsramSize() / (1024 * 1024));
   } else {
-    Serial.println("WARNING: No PSRAM detected, continuing with internal RAM");
+    Serial.println("WARNING: No PSRAM, continuing with internal RAM");
   }
 
   // Init TFT with safe defaults
