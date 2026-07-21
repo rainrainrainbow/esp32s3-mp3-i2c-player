@@ -7,6 +7,8 @@
 #include <AudioGeneratorMP3.h>
 #include <FFat.h>
 #include <esp_partition.h>
+#include <esp_spiram.h>
+#include <esp_task_wdt.h>
 #include "USB.h"
 #include "USBMSC.h"
 #include "board_config.h"
@@ -39,7 +41,6 @@ USBMSC MSC;
 static const esp_partition_t *storage_partition = NULL;
 #define STORAGE_PARTITION_LABEL "storage"
 
-// I2C Slave Callbacks
 void onRequest() {
   Wire.write(play_status);
 }
@@ -62,7 +63,6 @@ void onReceive(int len) {
   }
 }
 
-// USB MSC Callbacks
 static int32_t msc_onRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize) {
   if (!storage_partition) return 0;
   esp_err_t err = esp_partition_read(storage_partition, lba * 512 + offset, buffer, bufsize);
@@ -126,6 +126,11 @@ bool startPlayback(uint8_t track) {
   audio_file = new AudioFileSourceFS(FFat, path);
   mp3 = new AudioGeneratorMP3();
   audio_out = new AudioOutputI2S();
+  if (!audio_file || !mp3 || !audio_out) {
+    Serial.println("ERROR: Failed to allocate audio objects");
+    play_status = STATUS_ERROR;
+    return false;
+  }
   audio_out->SetPinout(AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT);
   audio_out->SetOutputModeMono(true);
   audio_out->SetGain(0.8);
@@ -141,57 +146,86 @@ bool startPlayback(uint8_t track) {
 }
 
 void setup() {
-  Serial.begin(115200); delay(1000);
-  Serial.println("ESP32-S3 MP3 Player with I2C Slave");
+  // Kill all watchdogs immediately
+  disableCore0WDT();
+  disableCore1WDT();
+  WRITE_PERI_REG(RTC_CNTL_WDTWPROTECT_REG, 0x50D83AA1);
+  WRITE_PERI_REG(RTC_CNTL_WDT_CONFIG_REG, 0);
+  WRITE_PERI_REG(RTC_CNTL_WDTWPROTECT_REG, 0);
 
-  tft.init(); tft.setRotation(3);
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n=== ESP32-S3 MP3 Player ===");
+
+  // Check PSRAM status - don't crash if missing
+  size_t psram_size = 0;
+  if (psramFound()) {
+    psram_size = esp_spiram_get_size();
+    Serial.printf("PSRAM found: %u MB\n", psram_size / (1024 * 1024));
+  } else {
+    Serial.println("WARNING: No PSRAM detected, continuing with internal RAM");
+  }
+
+  // Init TFT with safe defaults
+  tft.init();
+  tft.setRotation(3);
   tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK); tft.setTextSize(2);
-  tft.drawString("ESP32-S3 MP3", 40, 40);
-  tft.drawString("Player", 80, 70);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.drawString("Booting...", 60, 100);
+  Serial.println("TFT initialized");
 
+  // Find storage partition
   storage_partition = esp_partition_find_first(
     ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT,
     STORAGE_PARTITION_LABEL);
 
   if (storage_partition) {
-    Serial.printf("Storage: offset=0x%X, size=%u MB\n",
-      storage_partition->address, storage_partition->size / (1024*1024));
-    tft.drawString("Partition OK", 60, 120);
+    Serial.printf("Storage partition: 0x%X, %u MB\n",
+      storage_partition->address, storage_partition->size / (1024 * 1024));
+    tft.drawString("Partition OK", 60, 130);
   } else {
+    Serial.println("ERROR: Storage partition not found!");
     tft.setTextColor(TFT_RED);
-    tft.drawString("Partition FAIL", 40, 120);
+    tft.drawString("Partition FAIL", 40, 130);
   }
 
+  // Mount FAT - try with auto format on first use
   if (FFat.begin(false, STORAGE_PARTITION_LABEL, 5)) {
     Serial.println("FFat mounted");
     tft.setTextColor(TFT_GREEN);
-    tft.drawString("FFat Mounted", 40, 150);
+    tft.drawString("FFat OK", 60, 160);
+
+    // List root
     fs::File root = FFat.open("/");
     if (root) {
       fs::File f = root.openNextFile();
       while (f) {
-        Serial.printf("  %s %s\n", f.isDirectory()?"DIR":"FILE", f.name());
+        Serial.printf("  %s %s\n", f.isDirectory() ? "DIR" : "FILE", f.name());
         f = root.openNextFile();
       }
       root.close();
     }
   } else {
+    Serial.println("WARNING: FFat mount failed, try formatting...");
     tft.setTextColor(TFT_RED);
-    tft.drawString("FFat FAIL", 40, 150);
+    tft.drawString("FFat FAIL", 60, 160);
+    // Don't crash - let user format via USB MSC
   }
 
+  // I2C Slave
   Wire.onRequest(onRequest);
   Wire.onReceive(onReceive);
   Wire.begin((uint8_t)I2C_SLAVE_ADDR, I2C_SLAVE_SDA, I2C_SLAVE_SCL, 100000);
-  Serial.printf("I2C Slave: addr=0x%02X\n", I2C_SLAVE_ADDR);
+  Serial.printf("I2C Slave: 0x%02X\n", I2C_SLAVE_ADDR);
   tft.setTextColor(TFT_YELLOW);
-  tft.drawString("I2C Slave 0x52", 40, 180);
+  tft.drawString("I2C 0x52", 60, 190);
 
+  // PA pin
   pinMode(AUDIO_CODEC_PA_PIN, OUTPUT);
   digitalWrite(AUDIO_CODEC_PA_PIN, LOW);
 
-  // Setup USB MSC
+  // USB MSC
   if (storage_partition) {
     uint32_t block_count = storage_partition->size / 512;
     MSC.vendorID("ESP32");
@@ -205,10 +239,12 @@ void setup() {
     Serial.println("USB MSC started");
   }
 
-  delay(1500);
+  delay(1000);
   tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE); tft.setTextSize(2);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(2);
   tft.drawString("Ready", 100, 120);
+  tft.drawString("I2C Slave 0x52", 40, 160);
   Serial.println("Setup complete, waiting for I2C commands...");
 }
 
