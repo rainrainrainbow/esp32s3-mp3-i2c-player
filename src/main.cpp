@@ -10,8 +10,7 @@
 #include "USBMSC.h"
 #include "board_config.h"
 
-// Manually create USBCDC (no ARDUINO_USB_CDC_ON_BOOT)
-USBCDC USBSerial;
+// Serial is USB CDC (ARDUINO_USB_CDC_ON_BOOT=1)
 
 // ============================================================
 // ILI9341 Driver (no TFT_eSPI)
@@ -145,7 +144,7 @@ bool startPlayback(uint8_t track) {
   char path[32];
   snprintf(path, sizeof(path), "/music/%03d.mp3", track);
   if (!FFat.exists(path)) {
-    USBSerial.printf("Not found: %s\n", path);
+    Serial.printf("Not found: %s\n", path);
     play_status = STATUS_ERROR;
     return false;
   }
@@ -159,7 +158,7 @@ bool startPlayback(uint8_t track) {
   current_track = track;
   play_status = STATUS_PLAYING;
   digitalWrite(AUDIO_CODEC_PA_PIN, HIGH);
-  USBSerial.printf("Playing: Track %d\n", track);
+  Serial.printf("Playing: Track %d\n", track);
   return true;
 }
 
@@ -167,33 +166,32 @@ void mountFFat() {
   if (ffat_mounted || usb_connected) return;
   if (FFat.begin(false, STORAGE_PARTITION_LABEL, 5)) {
     ffat_mounted = true;
-    USBSerial.println("FFat mounted");
+    Serial.println("FFat mounted");
     tft_fill(0x07E0);
   } else {
-    USBSerial.println("FFat not mounted - plug USB to format");
+    Serial.println("FFat not mounted - plug USB to format");
     tft_fill(0xF800);
   }
 }
 
 void setup() {
-  // Initialize USB CDC serial FIRST (manual USBCDC object)
-  USBSerial.begin(115200);
-  USBSerial.setDebugOutput(true);
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
   delay(500);
-  USBSerial.println("\n=== ESP32-S3 MP3 Player v12 ===");
+  Serial.println("\n=== ESP32-S3 MP3 Player v12 ===");
 
   pinMode(LEFT_BUTTON_GPIO, INPUT_PULLUP);
   pinMode(RIGHT_BUTTON_GPIO, INPUT_PULLUP);
 
   tft_init();
   tft_fill(0x001F);
-  USBSerial.println("TFT OK");
+  Serial.println("TFT OK");
 
   storage_partition = esp_partition_find_first(
     ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT,
     STORAGE_PARTITION_LABEL);
   if (storage_partition) {
-    USBSerial.printf("Storage: %u MB\n", storage_partition->size/(1024*1024));
+    Serial.printf("Storage: %u MB\n", storage_partition->size/(1024*1024));
   }
 
   // Try mount FS (in case already formatted)
@@ -209,22 +207,22 @@ void setup() {
     MSC.onWrite(msc_onWrite);
     MSC.mediaPresent(true);
     MSC.begin(storage_partition->size / 512, 512);
-    USBSerial.println("MSC registered");
+    Serial.println("MSC registered");
   }
 
-  // USB.begin() MUST be called AFTER all individual device begin()
+  // USB.begin() starts the composite device (CDC + MSC)
   USB.begin();
-  USBSerial.println("USB started (CDC + MSC composite)");
+  Serial.println("USB started (CDC + MSC composite)");
 
   Wire.onRequest(onRequest);
   Wire.onReceive(onReceive);
   Wire.begin((uint8_t)I2C_SLAVE_ADDR, I2C_SLAVE_SDA, I2C_SLAVE_SCL, 100000);
-  USBSerial.println("I2C Slave 0x52");
+  Serial.println("I2C Slave 0x52");
 
   pinMode(AUDIO_CODEC_PA_PIN, OUTPUT);
   digitalWrite(AUDIO_CODEC_PA_PIN, LOW);
 
-  USBSerial.println("Ready");
+  Serial.println("Ready");
 }
 
 void loop() {
@@ -236,12 +234,12 @@ void loop() {
   if (millis() - lastBtnPress > 300) {
     if (digitalRead(LEFT_BUTTON_GPIO) == LOW) {
       lastBtnPress = millis();
-      USBSerial.println("LEFT");
+      Serial.println("LEFT");
       if (current_track > 1) target_track = current_track - 1;
     }
     if (digitalRead(RIGHT_BUTTON_GPIO) == LOW) {
       lastBtnPress = millis();
-      USBSerial.println("RIGHT");
+      Serial.println("RIGHT");
       target_track = current_track + 1;
     }
   }
@@ -257,7 +255,7 @@ void loop() {
 
   if (mp3 && mp3->isRunning()) {
     if (!mp3->loop()) {
-      USBSerial.printf("Track %d done\n", current_track);
+      Serial.printf("Track %d done\n", current_track);
       stopPlayback();
     }
   }
