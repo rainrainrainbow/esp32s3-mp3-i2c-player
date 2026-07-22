@@ -10,7 +10,6 @@
 #include "USBMSC.h"
 #include "board_config.h"
 
-// ILI9341
 #define TFT_CS   2
 #define TFT_DC   1
 #define TFT_CLK  21
@@ -54,7 +53,6 @@ void tft_init() {
   tft_fill(0x0000);
 }
 
-// I2C Slave
 #define I2C_SLAVE_ADDR 0x52
 #define REG_TRACK_NUM  0x01
 #define REG_PLAY_STATUS 0x02
@@ -73,8 +71,9 @@ USBMSC MSC;
 static const esp_partition_t *storage_partition = NULL;
 #define STORAGE_PARTITION_LABEL "storage"
 static unsigned long lastBtnPress = 0;
+static bool usb_connected = false;
+static bool ffat_mounted = false;
 
-// 4K aligned bounce buffer (must be in internal RAM, not PSRAM)
 static uint8_t msc_buf[4096] __attribute__((aligned(4)));
 
 void onRequest() { Wire.write(play_status); }
@@ -88,38 +87,41 @@ void onReceive(int len) {
   }
 }
 
-// MSC Read: read full 4K sectors into bounce buffer, copy requested portion
 static int32_t msc_onRead(uint32_t lba, uint32_t off, void *buf, uint32_t sz) {
   if (!storage_partition) return 0;
   uint32_t addr = lba * 512 + off;
   uint32_t sector = addr / 4096;
   uint32_t offset_in_sector = addr % 4096;
-  if (offset_in_sector + sz > 4096) return 0; // should not cross 4K boundary
+  if (offset_in_sector + sz > 4096) return 0;
   esp_partition_read(storage_partition, sector * 4096, msc_buf, 4096);
   memcpy(buf, msc_buf + offset_in_sector, sz);
   return sz;
 }
 
-// MSC Write: read-modify-write at 4K granularity
 static int32_t msc_onWrite(uint32_t lba, uint32_t off, uint8_t *buf, uint32_t sz) {
   if (!storage_partition) return 0;
   uint32_t addr = lba * 512 + off;
   uint32_t sector = addr / 4096;
   uint32_t offset_in_sector = addr % 4096;
   uint32_t end = offset_in_sector + sz;
-  if (end > 4096) return 0; // should not cross 4K boundary
+  if (end > 4096) return 0;
 
-  // Read entire 4K sector
   esp_partition_read(storage_partition, sector * 4096, msc_buf, 4096);
-  // Modify the requested portion
   memcpy(msc_buf + offset_in_sector, buf, sz);
-  // Erase and write back full 4K sector
   esp_partition_erase_range(storage_partition, sector * 4096, 4096);
   esp_partition_write(storage_partition, sector * 4096, msc_buf, 4096);
+
+  // If Windows wrote to the partition, FS may have changed
+  // Mark ffat as needing remount
+  ffat_mounted = false;
   return sz;
 }
 
-static bool msc_onStartStop(uint8_t pc, bool start, bool eject) { return true; }
+static bool msc_onStartStop(uint8_t pc, bool start, bool eject) {
+  if (start) usb_connected = true;
+  else usb_connected = false;
+  return true;
+}
 
 void stopPlayback() {
   if (mp3 && mp3->isRunning()) mp3->stop();
@@ -154,10 +156,24 @@ bool startPlayback(uint8_t track) {
   return true;
 }
 
+void mountFFat() {
+  if (ffat_mounted) return;
+  if (usb_connected) return; // don't mount while USB is active
+
+  if (FFat.begin(false, STORAGE_PARTITION_LABEL, 5)) {
+    ffat_mounted = true;
+    Serial.println("FFat mounted");
+    tft_fill(0x07E0);
+  } else {
+    Serial.println("FFat not mounted - plug USB to format");
+    tft_fill(0xF800);
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== ESP32-S3 MP3 Player v10 ===");
+  Serial.println("\n=== ESP32-S3 MP3 Player v11 ===");
 
   pinMode(LEFT_BUTTON_GPIO, INPUT_PULLUP);
   pinMode(RIGHT_BUTTON_GPIO, INPUT_PULLUP);
@@ -170,19 +186,14 @@ void setup() {
     ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT,
     STORAGE_PARTITION_LABEL);
   if (storage_partition) {
-    Serial.printf("Storage: %u MB @ 0x%X\n", storage_partition->size/(1024*1024), storage_partition->address);
+    Serial.printf("Storage: %u MB\n", storage_partition->size/(1024*1024));
   }
 
-  // Format FAT filesystem first (creates proper MBR+FAT)
-  if (FFat.begin(true, STORAGE_PARTITION_LABEL, 10)) {
-    Serial.println("FFat formatted OK");
-    tft_fill(0x07E0);
-  } else {
-    Serial.println("FFat format FAIL");
-    tft_fill(0xF800);
-  }
+  // Do NOT format FFat! Let Windows format it via MSC.
+  // Just try to mount - if fails, user plugs USB to format
+  mountFFat();
 
-  // Register MSC
+  // Register MSC and start USB
   if (storage_partition) {
     MSC.vendorID("ESP32");
     MSC.productID("S3-MP3");
@@ -210,6 +221,11 @@ void setup() {
 }
 
 void loop() {
+  // Try to mount FFat when USB is disconnected
+  if (!usb_connected && !ffat_mounted) {
+    mountFFat();
+  }
+
   if (millis() - lastBtnPress > 300) {
     if (digitalRead(LEFT_BUTTON_GPIO) == LOW) {
       lastBtnPress = millis();
