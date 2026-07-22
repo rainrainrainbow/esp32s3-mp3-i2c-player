@@ -35,14 +35,6 @@ void tft_data(uint8_t d) {
   digitalWrite(TFT_CS, HIGH);
 }
 
-void tft_data16(uint16_t d) {
-  digitalWrite(TFT_DC, HIGH);
-  digitalWrite(TFT_CS, LOW);
-  tft_spi->write(d >> 8);
-  tft_spi->write(d & 0xFF);
-  digitalWrite(TFT_CS, HIGH);
-}
-
 void tft_setAddr(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
   tft_cmd(0x2A);
   tft_data(x0>>8); tft_data(x0); tft_data(x1>>8); tft_data(x1);
@@ -50,6 +42,17 @@ void tft_setAddr(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
   tft_data(y0>>8); tft_data(y0); tft_data(y1>>8); tft_data(y1);
   tft_cmd(0x2C);
 }
+
+void tft_fillRGB(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t c) {
+  tft_setAddr(x0, y0, x1, y1);
+  digitalWrite(TFT_DC, HIGH);
+  digitalWrite(TFT_CS, LOW);
+  uint32_t n = (x1-x0+1)*(y1-y0+1);
+  for (uint32_t i = 0; i < n; i++) { tft_spi->write(c>>8); tft_spi->write(c&0xFF); }
+  digitalWrite(TFT_CS, HIGH);
+}
+
+void tft_fill(uint16_t c) { tft_fillRGB(0, 0, 239, 319, c); }
 
 void tft_init() {
   tft_spi = new SPIClass(FSPI);
@@ -67,24 +70,12 @@ void tft_init() {
   delay(50);
   tft_cmd(0x01); delay(150);
   tft_cmd(0x11); delay(150);
-  tft_cmd(0x36); tft_data(0xE8); // BGR+MX+MY+MV
+  // NO MV bit (bit 5) - CASET=X, PASET=Y, portrait 240x320
+  tft_cmd(0x36); tft_data(0x48); // MX=1, MY=1, BGR=1 (no MV)
   tft_cmd(0x3A); tft_data(0x55);
   tft_cmd(0x29); delay(50);
 
-  // full black
-  tft_setAddr(0, 0, 239, 319);
-  digitalWrite(TFT_DC, HIGH);
-  digitalWrite(TFT_CS, LOW);
-  for (int i = 0; i < 240*320; i++) { tft_spi->write(0); tft_spi->write(0); }
-  digitalWrite(TFT_CS, HIGH);
-}
-
-void tft_fill(uint16_t c) {
-  tft_setAddr(0, 0, 239, 319);
-  digitalWrite(TFT_DC, HIGH);
-  digitalWrite(TFT_CS, LOW);
-  for (int i = 0; i < 240*320; i++) { tft_spi->write(c>>8); tft_spi->write(c&0xFF); }
-  digitalWrite(TFT_CS, HIGH);
+  tft_fill(0x0000);
 }
 
 // ============================================================
@@ -142,7 +133,6 @@ void stopPlayback() {
   delete audio_out; audio_out = NULL;
   play_status = STATUS_STOPPED;
   digitalWrite(AUDIO_CODEC_PA_PIN, LOW);
-  Serial.println("Stopped");
 }
 
 bool startPlayback(uint8_t track) {
@@ -172,30 +162,24 @@ bool startPlayback(uint8_t track) {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== ESP32-S3 MP3 Player v7 ===");
+  Serial.println("\n=== ESP32-S3 MP3 Player v8 ===");
 
   pinMode(LEFT_BUTTON_GPIO, INPUT_PULLUP);
   pinMode(RIGHT_BUTTON_GPIO, INPUT_PULLUP);
 
-  // TFT
   tft_init();
   tft_fill(0x001F);
   Serial.println("TFT OK");
 
-  // Storage partition
   storage_partition = esp_partition_find_first(
     ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT,
     STORAGE_PARTITION_LABEL);
+
   if (storage_partition) {
     Serial.printf("Storage: %u MB\n", storage_partition->size/(1024*1024));
   }
 
-  // USB must start BEFORE FFat, so MSC can expose raw partition
-  // USB.begin() enables composite CDC+MSC
-  USB.begin();
-  Serial.println("USB started");
-
-  // MSC registers on top of USB
+  // USB MSC: begin() first, then mediaPresent()
   if (storage_partition) {
     MSC.vendorID("ESP32");
     MSC.productID("S3-MP3");
@@ -203,20 +187,22 @@ void setup() {
     MSC.onStartStop(msc_onStartStop);
     MSC.onRead(msc_onRead);
     MSC.onWrite(msc_onWrite);
-    MSC.mediaPresent(true);
     MSC.begin(storage_partition->size/512, 512);
-    Serial.println("MSC started");
-    tft_fill(0x07E0); // green = MSC ready
+    MSC.mediaPresent(true);
+    Serial.println("MSC ready");
   }
 
-  // Now try FFat - if fails, user can format via USB
-  if (FFat.begin(false, STORAGE_PARTITION_LABEL, 5)) {
+  USB.begin();
+  Serial.println("USB started");
+
+  // Format FAT if needed (true = format if mount fails)
+  if (FFat.begin(true, STORAGE_PARTITION_LABEL, 5)) {
     Serial.println("FFat OK");
+    tft_fillRGB(0, 0, 239, 319, 0x07E0);
   } else {
-    Serial.println("FFat FAIL - plug USB to format");
+    Serial.println("FFat FAIL");
   }
 
-  // I2C
   Wire.onRequest(onRequest);
   Wire.onReceive(onReceive);
   Wire.begin((uint8_t)I2C_SLAVE_ADDR, I2C_SLAVE_SDA, I2C_SLAVE_SCL, 100000);
