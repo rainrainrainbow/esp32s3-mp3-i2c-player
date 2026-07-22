@@ -10,65 +10,43 @@
 #include "USBMSC.h"
 #include "board_config.h"
 
-// ============================================================
-// ILI9341 Minimal Driver
-// ============================================================
+// ILI9341
 #define TFT_CS   2
 #define TFT_DC   1
 #define TFT_CLK  21
 #define TFT_MOSI 47
 #define TFT_BL   14
-
 static SPIClass *tft_spi = NULL;
 
 void tft_cmd(uint8_t c) {
-  digitalWrite(TFT_DC, LOW);
-  digitalWrite(TFT_CS, LOW);
+  digitalWrite(TFT_DC, LOW); digitalWrite(TFT_CS, LOW);
   tft_spi->write(c);
   digitalWrite(TFT_CS, HIGH);
 }
-
 void tft_data(uint8_t d) {
-  digitalWrite(TFT_DC, HIGH);
-  digitalWrite(TFT_CS, LOW);
+  digitalWrite(TFT_DC, HIGH); digitalWrite(TFT_CS, LOW);
   tft_spi->write(d);
   digitalWrite(TFT_CS, HIGH);
 }
-
 void tft_setAddr(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
-  tft_cmd(0x2A);
-  tft_data(x0>>8); tft_data(x0); tft_data(x1>>8); tft_data(x1);
-  tft_cmd(0x2B);
-  tft_data(y0>>8); tft_data(y0); tft_data(y1>>8); tft_data(y1);
+  tft_cmd(0x2A); tft_data(x0>>8); tft_data(x0); tft_data(x1>>8); tft_data(x1);
+  tft_cmd(0x2B); tft_data(y0>>8); tft_data(y0); tft_data(y1>>8); tft_data(y1);
   tft_cmd(0x2C);
 }
-
-void tft_fillRGB(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t c) {
-  tft_setAddr(x0, y0, x1, y1);
-  digitalWrite(TFT_DC, HIGH);
-  digitalWrite(TFT_CS, LOW);
-  uint32_t n = (x1-x0+1)*(y1-y0+1);
-  for (uint32_t i = 0; i < n; i++) { tft_spi->write(c>>8); tft_spi->write(c&0xFF); }
+void tft_fill(uint16_t c) {
+  tft_setAddr(0, 0, 239, 319);
+  digitalWrite(TFT_DC, HIGH); digitalWrite(TFT_CS, LOW);
+  for (uint32_t i = 0; i < 240*320; i++) { tft_spi->write(c>>8); tft_spi->write(c&0xFF); }
   digitalWrite(TFT_CS, HIGH);
 }
-
-void tft_fill(uint16_t c) { tft_fillRGB(0, 0, 239, 319, c); }
-
 void tft_init() {
   tft_spi = new SPIClass(FSPI);
   tft_spi->begin(TFT_CLK, -1, TFT_MOSI, TFT_CS);
   tft_spi->setFrequency(40000000);
-  tft_spi->setBitOrder(MSBFIRST);
-  tft_spi->setDataMode(SPI_MODE0);
-
-  pinMode(TFT_DC, OUTPUT);
-  pinMode(TFT_CS, OUTPUT);
-  pinMode(TFT_BL, OUTPUT);
-  digitalWrite(TFT_CS, HIGH);
-  digitalWrite(TFT_BL, HIGH);
-
-  delay(50);
-  tft_cmd(0x01); delay(150);
+  tft_spi->setBitOrder(MSBFIRST); tft_spi->setDataMode(SPI_MODE0);
+  pinMode(TFT_DC, OUTPUT); pinMode(TFT_CS, OUTPUT); pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_CS, HIGH); digitalWrite(TFT_BL, HIGH);
+  delay(50); tft_cmd(0x01); delay(150);
   tft_cmd(0x11); delay(150);
   tft_cmd(0x36); tft_data(0x48);
   tft_cmd(0x3A); tft_data(0x55);
@@ -76,23 +54,17 @@ void tft_init() {
   tft_fill(0x0000);
 }
 
-// ============================================================
 // I2C Slave
-// ============================================================
 #define I2C_SLAVE_ADDR 0x52
 #define REG_TRACK_NUM  0x01
 #define REG_PLAY_STATUS 0x02
-
 #define STATUS_STOPPED  0
 #define STATUS_PLAYING  1
 #define STATUS_PAUSED   2
 #define STATUS_CHANGING 3
 #define STATUS_ERROR    4
 
-static uint8_t current_track = 0;
-static uint8_t target_track = 0;
-static uint8_t play_status = STATUS_STOPPED;
-
+static uint8_t current_track = 0, target_track = 0, play_status = STATUS_STOPPED;
 AudioGeneratorMP3 *mp3 = NULL;
 AudioFileSourceFS *audio_file = NULL;
 AudioOutputI2S *audio_out = NULL;
@@ -100,11 +72,10 @@ AudioOutputI2S *audio_out = NULL;
 USBMSC MSC;
 static const esp_partition_t *storage_partition = NULL;
 #define STORAGE_PARTITION_LABEL "storage"
-
 static unsigned long lastBtnPress = 0;
 
-// MSC aligned bounce buffer (4K)
-static uint8_t msc_buffer[4096] __attribute__((aligned(4)));
+// 4K aligned bounce buffer (must be in internal RAM, not PSRAM)
+static uint8_t msc_buf[4096] __attribute__((aligned(4)));
 
 void onRequest() { Wire.write(play_status); }
 
@@ -117,29 +88,35 @@ void onReceive(int len) {
   }
 }
 
+// MSC Read: read full 4K sectors into bounce buffer, copy requested portion
 static int32_t msc_onRead(uint32_t lba, uint32_t off, void *buf, uint32_t sz) {
-  if (!storage_partition || sz > sizeof(msc_buffer)) return 0;
-  esp_err_t err = esp_partition_read(storage_partition, lba * 512 + off, msc_buffer, (sz + 3) & ~3);
-  if (err == ESP_OK) { memcpy(buf, msc_buffer, sz); return sz; }
-  return 0;
+  if (!storage_partition) return 0;
+  uint32_t addr = lba * 512 + off;
+  uint32_t sector = addr / 4096;
+  uint32_t offset_in_sector = addr % 4096;
+  if (offset_in_sector + sz > 4096) return 0; // should not cross 4K boundary
+  esp_partition_read(storage_partition, sector * 4096, msc_buf, 4096);
+  memcpy(buf, msc_buf + offset_in_sector, sz);
+  return sz;
 }
 
+// MSC Write: read-modify-write at 4K granularity
 static int32_t msc_onWrite(uint32_t lba, uint32_t off, uint8_t *buf, uint32_t sz) {
-  if (!storage_partition || sz > sizeof(msc_buffer)) return 0;
-  // Align to 4 bytes
-  uint32_t aligned_sz = (sz + 3) & ~3;
-  uint32_t flash_off = lba * 512 + off;
-  // Erase the sector range first
-  uint32_t start_sector = flash_off / 4096;
-  uint32_t end_sector = (flash_off + aligned_sz - 1) / 4096;
-  for (uint32_t s = start_sector; s <= end_sector; s++) {
-    esp_partition_erase_range(storage_partition, s * 4096, 4096);
-  }
-  // Copy and pad
-  memcpy(msc_buffer, buf, sz);
-  if (aligned_sz > sz) memset(msc_buffer + sz, 0, aligned_sz - sz);
-  esp_err_t err = esp_partition_write(storage_partition, flash_off, msc_buffer, aligned_sz);
-  return (err == ESP_OK) ? sz : 0;
+  if (!storage_partition) return 0;
+  uint32_t addr = lba * 512 + off;
+  uint32_t sector = addr / 4096;
+  uint32_t offset_in_sector = addr % 4096;
+  uint32_t end = offset_in_sector + sz;
+  if (end > 4096) return 0; // should not cross 4K boundary
+
+  // Read entire 4K sector
+  esp_partition_read(storage_partition, sector * 4096, msc_buf, 4096);
+  // Modify the requested portion
+  memcpy(msc_buf + offset_in_sector, buf, sz);
+  // Erase and write back full 4K sector
+  esp_partition_erase_range(storage_partition, sector * 4096, 4096);
+  esp_partition_write(storage_partition, sector * 4096, msc_buf, 4096);
+  return sz;
 }
 
 static bool msc_onStartStop(uint8_t pc, bool start, bool eject) { return true; }
@@ -180,7 +157,7 @@ bool startPlayback(uint8_t track) {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== ESP32-S3 MP3 Player v9 ===");
+  Serial.println("\n=== ESP32-S3 MP3 Player v10 ===");
 
   pinMode(LEFT_BUTTON_GPIO, INPUT_PULLUP);
   pinMode(RIGHT_BUTTON_GPIO, INPUT_PULLUP);
@@ -192,22 +169,20 @@ void setup() {
   storage_partition = esp_partition_find_first(
     ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT,
     STORAGE_PARTITION_LABEL);
-
   if (storage_partition) {
-    Serial.printf("Storage: %u MB\n", storage_partition->size/(1024*1024));
+    Serial.printf("Storage: %u MB @ 0x%X\n", storage_partition->size/(1024*1024), storage_partition->address);
   }
 
-  // STEP 1: Format FAT filesystem FIRST
-  // This creates a valid MBR+FAT on the partition before MSC exposes it
+  // Format FAT filesystem first (creates proper MBR+FAT)
   if (FFat.begin(true, STORAGE_PARTITION_LABEL, 10)) {
     Serial.println("FFat formatted OK");
-    tft_fill(0x07E0); // green
+    tft_fill(0x07E0);
   } else {
     Serial.println("FFat format FAIL");
-    tft_fill(0xF800); // red
+    tft_fill(0xF800);
   }
 
-  // STEP 2: Register MSC callbacks with aligned buffer
+  // Register MSC
   if (storage_partition) {
     MSC.vendorID("ESP32");
     MSC.productID("S3-MP3");
@@ -220,7 +195,6 @@ void setup() {
     Serial.println("MSC registered");
   }
 
-  // STEP 3: Start USB (composite CDC + MSC)
   USB.begin();
   Serial.println("USB started");
 
