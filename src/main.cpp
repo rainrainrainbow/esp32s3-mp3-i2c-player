@@ -70,11 +70,9 @@ void tft_init() {
   delay(50);
   tft_cmd(0x01); delay(150);
   tft_cmd(0x11); delay(150);
-  // NO MV bit (bit 5) - CASET=X, PASET=Y, portrait 240x320
-  tft_cmd(0x36); tft_data(0x48); // MX=1, MY=1, BGR=1 (no MV)
+  tft_cmd(0x36); tft_data(0x48);
   tft_cmd(0x3A); tft_data(0x55);
   tft_cmd(0x29); delay(50);
-
   tft_fill(0x0000);
 }
 
@@ -105,6 +103,9 @@ static const esp_partition_t *storage_partition = NULL;
 
 static unsigned long lastBtnPress = 0;
 
+// MSC aligned bounce buffer (4K)
+static uint8_t msc_buffer[4096] __attribute__((aligned(4)));
+
 void onRequest() { Wire.write(play_status); }
 
 void onReceive(int len) {
@@ -117,13 +118,30 @@ void onReceive(int len) {
 }
 
 static int32_t msc_onRead(uint32_t lba, uint32_t off, void *buf, uint32_t sz) {
-  if (!storage_partition) return 0;
-  return (esp_partition_read(storage_partition, lba*512+off, buf, sz) == ESP_OK) ? sz : 0;
+  if (!storage_partition || sz > sizeof(msc_buffer)) return 0;
+  esp_err_t err = esp_partition_read(storage_partition, lba * 512 + off, msc_buffer, (sz + 3) & ~3);
+  if (err == ESP_OK) { memcpy(buf, msc_buffer, sz); return sz; }
+  return 0;
 }
+
 static int32_t msc_onWrite(uint32_t lba, uint32_t off, uint8_t *buf, uint32_t sz) {
-  if (!storage_partition) return 0;
-  return (esp_partition_write(storage_partition, lba*512+off, buf, sz) == ESP_OK) ? sz : 0;
+  if (!storage_partition || sz > sizeof(msc_buffer)) return 0;
+  // Align to 4 bytes
+  uint32_t aligned_sz = (sz + 3) & ~3;
+  uint32_t flash_off = lba * 512 + off;
+  // Erase the sector range first
+  uint32_t start_sector = flash_off / 4096;
+  uint32_t end_sector = (flash_off + aligned_sz - 1) / 4096;
+  for (uint32_t s = start_sector; s <= end_sector; s++) {
+    esp_partition_erase_range(storage_partition, s * 4096, 4096);
+  }
+  // Copy and pad
+  memcpy(msc_buffer, buf, sz);
+  if (aligned_sz > sz) memset(msc_buffer + sz, 0, aligned_sz - sz);
+  esp_err_t err = esp_partition_write(storage_partition, flash_off, msc_buffer, aligned_sz);
+  return (err == ESP_OK) ? sz : 0;
 }
+
 static bool msc_onStartStop(uint8_t pc, bool start, bool eject) { return true; }
 
 void stopPlayback() {
@@ -162,7 +180,7 @@ bool startPlayback(uint8_t track) {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== ESP32-S3 MP3 Player v8 ===");
+  Serial.println("\n=== ESP32-S3 MP3 Player v9 ===");
 
   pinMode(LEFT_BUTTON_GPIO, INPUT_PULLUP);
   pinMode(RIGHT_BUTTON_GPIO, INPUT_PULLUP);
@@ -179,7 +197,17 @@ void setup() {
     Serial.printf("Storage: %u MB\n", storage_partition->size/(1024*1024));
   }
 
-  // USB MSC: begin() first, then mediaPresent()
+  // STEP 1: Format FAT filesystem FIRST
+  // This creates a valid MBR+FAT on the partition before MSC exposes it
+  if (FFat.begin(true, STORAGE_PARTITION_LABEL, 10)) {
+    Serial.println("FFat formatted OK");
+    tft_fill(0x07E0); // green
+  } else {
+    Serial.println("FFat format FAIL");
+    tft_fill(0xF800); // red
+  }
+
+  // STEP 2: Register MSC callbacks with aligned buffer
   if (storage_partition) {
     MSC.vendorID("ESP32");
     MSC.productID("S3-MP3");
@@ -187,21 +215,14 @@ void setup() {
     MSC.onStartStop(msc_onStartStop);
     MSC.onRead(msc_onRead);
     MSC.onWrite(msc_onWrite);
-    MSC.begin(storage_partition->size/512, 512);
+    MSC.begin(storage_partition->size / 512, 512);
     MSC.mediaPresent(true);
-    Serial.println("MSC ready");
+    Serial.println("MSC registered");
   }
 
+  // STEP 3: Start USB (composite CDC + MSC)
   USB.begin();
   Serial.println("USB started");
-
-  // Format FAT if needed (true = format if mount fails)
-  if (FFat.begin(true, STORAGE_PARTITION_LABEL, 5)) {
-    Serial.println("FFat OK");
-    tft_fillRGB(0, 0, 239, 319, 0x07E0);
-  } else {
-    Serial.println("FFat FAIL");
-  }
 
   Wire.onRequest(onRequest);
   Wire.onReceive(onReceive);
