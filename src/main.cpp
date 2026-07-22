@@ -10,6 +10,12 @@
 #include "USBMSC.h"
 #include "board_config.h"
 
+// Manually create USBCDC (no ARDUINO_USB_CDC_ON_BOOT)
+USBCDC USBSerial;
+
+// ============================================================
+// ILI9341 Driver (no TFT_eSPI)
+// ============================================================
 #define TFT_CS   2
 #define TFT_DC   1
 #define TFT_CLK  21
@@ -53,6 +59,9 @@ void tft_init() {
   tft_fill(0x0000);
 }
 
+// ============================================================
+// I2C Slave
+// ============================================================
 #define I2C_SLAVE_ADDR 0x52
 #define REG_TRACK_NUM  0x01
 #define REG_PLAY_STATUS 0x02
@@ -74,6 +83,7 @@ static unsigned long lastBtnPress = 0;
 static bool usb_connected = false;
 static bool ffat_mounted = false;
 
+// 4K aligned bounce buffer for Flash read-modify-write
 static uint8_t msc_buf[4096] __attribute__((aligned(4)));
 
 void onRequest() { Wire.write(play_status); }
@@ -105,21 +115,18 @@ static int32_t msc_onWrite(uint32_t lba, uint32_t off, uint8_t *buf, uint32_t sz
   uint32_t offset_in_sector = addr % 4096;
   uint32_t end = offset_in_sector + sz;
   if (end > 4096) return 0;
-
+  // Read-modify-write: read full 4K, patch, erase, write back
   esp_partition_read(storage_partition, sector * 4096, msc_buf, 4096);
   memcpy(msc_buf + offset_in_sector, buf, sz);
   esp_partition_erase_range(storage_partition, sector * 4096, 4096);
   esp_partition_write(storage_partition, sector * 4096, msc_buf, 4096);
-
-  // If Windows wrote to the partition, FS may have changed
-  // Mark ffat as needing remount
+  // Mark FS as needing remount
   ffat_mounted = false;
   return sz;
 }
 
 static bool msc_onStartStop(uint8_t pc, bool start, bool eject) {
-  if (start) usb_connected = true;
-  else usb_connected = false;
+  usb_connected = start;
   return true;
 }
 
@@ -138,7 +145,7 @@ bool startPlayback(uint8_t track) {
   char path[32];
   snprintf(path, sizeof(path), "/music/%03d.mp3", track);
   if (!FFat.exists(path)) {
-    Serial.printf("Not found: %s\n", path);
+    USBSerial.printf("Not found: %s\n", path);
     play_status = STATUS_ERROR;
     return false;
   }
@@ -152,48 +159,47 @@ bool startPlayback(uint8_t track) {
   current_track = track;
   play_status = STATUS_PLAYING;
   digitalWrite(AUDIO_CODEC_PA_PIN, HIGH);
-  Serial.printf("Playing: Track %d\n", track);
+  USBSerial.printf("Playing: Track %d\n", track);
   return true;
 }
 
 void mountFFat() {
-  if (ffat_mounted) return;
-  if (usb_connected) return; // don't mount while USB is active
-
+  if (ffat_mounted || usb_connected) return;
   if (FFat.begin(false, STORAGE_PARTITION_LABEL, 5)) {
     ffat_mounted = true;
-    Serial.println("FFat mounted");
+    USBSerial.println("FFat mounted");
     tft_fill(0x07E0);
   } else {
-    Serial.println("FFat not mounted - plug USB to format");
+    USBSerial.println("FFat not mounted - plug USB to format");
     tft_fill(0xF800);
   }
 }
 
 void setup() {
-  Serial.begin(115200);
+  // Initialize USB CDC serial FIRST (manual USBCDC object)
+  USBSerial.begin(115200);
+  USBSerial.setDebugOutput(true);
   delay(500);
-  Serial.println("\n=== ESP32-S3 MP3 Player v11 ===");
+  USBSerial.println("\n=== ESP32-S3 MP3 Player v12 ===");
 
   pinMode(LEFT_BUTTON_GPIO, INPUT_PULLUP);
   pinMode(RIGHT_BUTTON_GPIO, INPUT_PULLUP);
 
   tft_init();
   tft_fill(0x001F);
-  Serial.println("TFT OK");
+  USBSerial.println("TFT OK");
 
   storage_partition = esp_partition_find_first(
     ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT,
     STORAGE_PARTITION_LABEL);
   if (storage_partition) {
-    Serial.printf("Storage: %u MB\n", storage_partition->size/(1024*1024));
+    USBSerial.printf("Storage: %u MB\n", storage_partition->size/(1024*1024));
   }
 
-  // Do NOT format FFat! Let Windows format it via MSC.
-  // Just try to mount - if fails, user plugs USB to format
+  // Try mount FS (in case already formatted)
   mountFFat();
 
-  // Register MSC and start USB
+  // Register MSC
   if (storage_partition) {
     MSC.vendorID("ESP32");
     MSC.productID("S3-MP3");
@@ -201,27 +207,28 @@ void setup() {
     MSC.onStartStop(msc_onStartStop);
     MSC.onRead(msc_onRead);
     MSC.onWrite(msc_onWrite);
-    MSC.begin(storage_partition->size / 512, 512);
     MSC.mediaPresent(true);
-    Serial.println("MSC registered");
+    MSC.begin(storage_partition->size / 512, 512);
+    USBSerial.println("MSC registered");
   }
 
+  // USB.begin() MUST be called AFTER all individual device begin()
   USB.begin();
-  Serial.println("USB started");
+  USBSerial.println("USB started (CDC + MSC composite)");
 
   Wire.onRequest(onRequest);
   Wire.onReceive(onReceive);
   Wire.begin((uint8_t)I2C_SLAVE_ADDR, I2C_SLAVE_SDA, I2C_SLAVE_SCL, 100000);
-  Serial.println("I2C Slave 0x52");
+  USBSerial.println("I2C Slave 0x52");
 
   pinMode(AUDIO_CODEC_PA_PIN, OUTPUT);
   digitalWrite(AUDIO_CODEC_PA_PIN, LOW);
 
-  Serial.println("Ready");
+  USBSerial.println("Ready");
 }
 
 void loop() {
-  // Try to mount FFat when USB is disconnected
+  // Auto-mount FFat when USB disconnected
   if (!usb_connected && !ffat_mounted) {
     mountFFat();
   }
@@ -229,12 +236,12 @@ void loop() {
   if (millis() - lastBtnPress > 300) {
     if (digitalRead(LEFT_BUTTON_GPIO) == LOW) {
       lastBtnPress = millis();
-      Serial.println("LEFT");
+      USBSerial.println("LEFT");
       if (current_track > 1) target_track = current_track - 1;
     }
     if (digitalRead(RIGHT_BUTTON_GPIO) == LOW) {
       lastBtnPress = millis();
-      Serial.println("RIGHT");
+      USBSerial.println("RIGHT");
       target_track = current_track + 1;
     }
   }
@@ -250,7 +257,7 @@ void loop() {
 
   if (mp3 && mp3->isRunning()) {
     if (!mp3->loop()) {
-      Serial.printf("Track %d done\n", current_track);
+      USBSerial.printf("Track %d done\n", current_track);
       stopPlayback();
     }
   }
