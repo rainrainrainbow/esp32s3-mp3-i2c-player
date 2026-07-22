@@ -18,7 +18,6 @@
 #define TFT_CLK  21
 #define TFT_MOSI 47
 #define TFT_BL   14
-#define TFT_RST  -1
 
 static SPIClass *tft_spi = NULL;
 
@@ -39,19 +38,20 @@ void tft_data(uint8_t d) {
 void tft_data16(uint16_t d) {
   digitalWrite(TFT_DC, HIGH);
   digitalWrite(TFT_CS, LOW);
-  tft_spi->write16(d);
+  tft_spi->write(d >> 8);
+  tft_spi->write(d & 0xFF);
   digitalWrite(TFT_CS, HIGH);
 }
 
-void tft_setAddrWindow(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
-  tft_cmd(0x2A); // CASET
-  tft_data16(x0); tft_data16(x1);
-  tft_cmd(0x2B); // PASET
-  tft_data16(y0); tft_data16(y1);
-  tft_cmd(0x2C); // RAMWR
+void tft_setAddr(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
+  tft_cmd(0x2A);
+  tft_data(x0>>8); tft_data(x0); tft_data(x1>>8); tft_data(x1);
+  tft_cmd(0x2B);
+  tft_data(y0>>8); tft_data(y0); tft_data(y1>>8); tft_data(y1);
+  tft_cmd(0x2C);
 }
 
-void tft_init_custom() {
+void tft_init() {
   tft_spi = new SPIClass(FSPI);
   tft_spi->begin(TFT_CLK, -1, TFT_MOSI, TFT_CS);
   tft_spi->setFrequency(40000000);
@@ -64,48 +64,27 @@ void tft_init_custom() {
   digitalWrite(TFT_CS, HIGH);
   digitalWrite(TFT_BL, HIGH);
 
-  delay(100);
+  delay(50);
   tft_cmd(0x01); delay(150);
+  tft_cmd(0x11); delay(150);
+  tft_cmd(0x36); tft_data(0xE8); // BGR+MX+MY+MV
+  tft_cmd(0x3A); tft_data(0x55);
+  tft_cmd(0x29); delay(50);
 
-  // ST7789 init (240x320 portrait, very common)
-  tft_cmd(0x11); delay(150); // SLPOUT
-  tft_cmd(0x3A); tft_data(0x55); // 16-bit color
-  tft_cmd(0x36); tft_data(0x00); // MADCTL: normal portrait
-  tft_cmd(0x21); // INVON (inversion on)
-  tft_cmd(0x13); // NORON
-  tft_cmd(0x29); delay(50); // DISPON
-
-  // Fill black
-  tft_setAddrWindow(0, 0, 239, 319);
+  // full black
+  tft_setAddr(0, 0, 239, 319);
   digitalWrite(TFT_DC, HIGH);
   digitalWrite(TFT_CS, LOW);
-  for (int i = 0; i < 240*320; i++) tft_spi->write16(0x0000);
+  for (int i = 0; i < 240*320; i++) { tft_spi->write(0); tft_spi->write(0); }
   digitalWrite(TFT_CS, HIGH);
 }
 
-void tft_fill(uint16_t color) {
-  tft_setAddrWindow(0, 0, 239, 319);
+void tft_fill(uint16_t c) {
+  tft_setAddr(0, 0, 239, 319);
   digitalWrite(TFT_DC, HIGH);
   digitalWrite(TFT_CS, LOW);
-  for (int i = 0; i < 240*320; i++) tft_spi->write16(color);
+  for (int i = 0; i < 240*320; i++) { tft_spi->write(c>>8); tft_spi->write(c&0xFF); }
   digitalWrite(TFT_CS, HIGH);
-}
-
-void tft_showTrack(uint8_t track) {
-  tft_fill(0x0000);
-  tft_cmd(0x36); tft_data(0x00);
-  tft_setAddrWindow(0, 0, 239, 319);
-  digitalWrite(TFT_DC, HIGH);
-  digitalWrite(TFT_CS, LOW);
-  // Simple color bar: top half blue, bottom half cyan
-  for (int y = 0; y < 160; y++) {
-    for (int x = 0; x < 240; x++) tft_spi->write16(0x001F);
-  }
-  for (int y = 0; y < 160; y++) {
-    for (int x = 0; x < 240; x++) tft_spi->write16(0x07FF);
-  }
-  digitalWrite(TFT_CS, HIGH);
-  Serial.printf("Show track: %d\n", track);
 }
 
 // ============================================================
@@ -133,7 +112,6 @@ USBMSC MSC;
 static const esp_partition_t *storage_partition = NULL;
 #define STORAGE_PARTITION_LABEL "storage"
 
-// Button state
 static unsigned long lastBtnPress = 0;
 
 void onRequest() { Wire.write(play_status); }
@@ -142,23 +120,18 @@ void onReceive(int len) {
   while (Wire.available() >= 2) {
     uint8_t reg = Wire.read();
     uint8_t val = Wire.read();
-    if (reg == REG_TRACK_NUM && val >= 1 && val <= 255) {
-      target_track = val;
-    } else if (reg == REG_PLAY_STATUS && val == STATUS_STOPPED) {
-      target_track = 0;
-    }
+    if (reg == REG_TRACK_NUM && val >= 1 && val <= 255) target_track = val;
+    else if (reg == REG_PLAY_STATUS && val == STATUS_STOPPED) target_track = 0;
   }
 }
 
 static int32_t msc_onRead(uint32_t lba, uint32_t off, void *buf, uint32_t sz) {
   if (!storage_partition) return 0;
-  if (esp_partition_read(storage_partition, lba*512+off, buf, sz) == ESP_OK) return sz;
-  return 0;
+  return (esp_partition_read(storage_partition, lba*512+off, buf, sz) == ESP_OK) ? sz : 0;
 }
 static int32_t msc_onWrite(uint32_t lba, uint32_t off, uint8_t *buf, uint32_t sz) {
   if (!storage_partition) return 0;
-  if (esp_partition_write(storage_partition, lba*512+off, buf, sz) == ESP_OK) return sz;
-  return 0;
+  return (esp_partition_write(storage_partition, lba*512+off, buf, sz) == ESP_OK) ? sz : 0;
 }
 static bool msc_onStartStop(uint8_t pc, bool start, bool eject) { return true; }
 
@@ -170,7 +143,6 @@ void stopPlayback() {
   play_status = STATUS_STOPPED;
   digitalWrite(AUDIO_CODEC_PA_PIN, LOW);
   Serial.println("Stopped");
-  tft_fill(0x0000);
 }
 
 bool startPlayback(uint8_t track) {
@@ -181,7 +153,6 @@ bool startPlayback(uint8_t track) {
   if (!FFat.exists(path)) {
     Serial.printf("Not found: %s\n", path);
     play_status = STATUS_ERROR;
-    tft_showTrack(track);
     return false;
   }
   audio_file = new AudioFileSourceFS(FFat, path);
@@ -195,25 +166,23 @@ bool startPlayback(uint8_t track) {
   play_status = STATUS_PLAYING;
   digitalWrite(AUDIO_CODEC_PA_PIN, HIGH);
   Serial.printf("Playing: Track %d\n", track);
-  tft_showTrack(track);
   return true;
 }
 
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== ESP32-S3 MP3 Player v6 ===");
+  Serial.println("\n=== ESP32-S3 MP3 Player v7 ===");
 
-  // Buttons: LEFT=GPIO0, RIGHT=GPIO43
   pinMode(LEFT_BUTTON_GPIO, INPUT_PULLUP);
   pinMode(RIGHT_BUTTON_GPIO, INPUT_PULLUP);
 
   // TFT
-  tft_init_custom();
-  tft_fill(0x001F); // blue screen = alive
+  tft_init();
+  tft_fill(0x001F);
   Serial.println("TFT OK");
 
-  // Storage
+  // Storage partition
   storage_partition = esp_partition_find_first(
     ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT,
     STORAGE_PARTITION_LABEL);
@@ -221,13 +190,30 @@ void setup() {
     Serial.printf("Storage: %u MB\n", storage_partition->size/(1024*1024));
   }
 
-  // FFat (format if needed)
+  // USB must start BEFORE FFat, so MSC can expose raw partition
+  // USB.begin() enables composite CDC+MSC
+  USB.begin();
+  Serial.println("USB started");
+
+  // MSC registers on top of USB
+  if (storage_partition) {
+    MSC.vendorID("ESP32");
+    MSC.productID("S3-MP3");
+    MSC.productRevision("1.0");
+    MSC.onStartStop(msc_onStartStop);
+    MSC.onRead(msc_onRead);
+    MSC.onWrite(msc_onWrite);
+    MSC.mediaPresent(true);
+    MSC.begin(storage_partition->size/512, 512);
+    Serial.println("MSC started");
+    tft_fill(0x07E0); // green = MSC ready
+  }
+
+  // Now try FFat - if fails, user can format via USB
   if (FFat.begin(false, STORAGE_PARTITION_LABEL, 5)) {
     Serial.println("FFat OK");
-    tft_fill(0x07E0); // green = FFat OK
   } else {
-    Serial.println("FFat FAIL - format via USB MSC");
-    tft_fill(0xF800); // red = no FS
+    Serial.println("FFat FAIL - plug USB to format");
   }
 
   // I2C
@@ -239,40 +225,23 @@ void setup() {
   pinMode(AUDIO_CODEC_PA_PIN, OUTPUT);
   digitalWrite(AUDIO_CODEC_PA_PIN, LOW);
 
-  // USB MSC
-  if (storage_partition) {
-    MSC.vendorID("ESP32");
-    MSC.productID("S3-MP3");
-    MSC.productRevision("1.0");
-    MSC.onStartStop(msc_onStartStop);
-    MSC.onRead(msc_onRead);
-    MSC.onWrite(msc_onWrite);
-    MSC.begin(storage_partition->size/512, 512);
-    USB.begin();
-    Serial.println("USB MSC OK");
-  }
-
   Serial.println("Ready");
 }
 
 void loop() {
-  // Button debounce
   if (millis() - lastBtnPress > 300) {
     if (digitalRead(LEFT_BUTTON_GPIO) == LOW) {
       lastBtnPress = millis();
-      Serial.println("LEFT button pressed");
-      if (current_track > 1) {
-        target_track = current_track - 1;
-      }
+      Serial.println("LEFT");
+      if (current_track > 1) target_track = current_track - 1;
     }
     if (digitalRead(RIGHT_BUTTON_GPIO) == LOW) {
       lastBtnPress = millis();
-      Serial.println("RIGHT button pressed");
+      Serial.println("RIGHT");
       target_track = current_track + 1;
     }
   }
 
-  // Handle track change
   if (target_track >= 1 && target_track <= 255) {
     uint8_t t = target_track;
     target_track = 0;
@@ -282,7 +251,6 @@ void loop() {
     }
   }
 
-  // Audio loop
   if (mp3 && mp3->isRunning()) {
     if (!mp3->loop()) {
       Serial.printf("Track %d done\n", current_track);
